@@ -16,6 +16,8 @@ module Fluent
     config_param :stream_identity_key, :string, default: nil
     desc "The interval between data flushes"
     config_param :flush_interval, :time, default: 60
+    desc "The label name to handle timeout"
+    config_param :timeout_label, :string, default: nil
 
     class TimeoutError < StandardError
     end
@@ -134,12 +136,13 @@ module Fluent
 
     def flush_buffer(stream_identity, new_element = nil)
       lines = @buffer[stream_identity].map {|_tag, _time, record| record[@key] }
+      _tag, _time, last_record = @buffer[stream_identity].last
       new_record = {
         @key => lines.join(@separator)
       }
       @buffer[stream_identity] = []
       @buffer[stream_identity] << new_element if new_element
-      new_record
+      last_record.merge(new_record)
     end
 
     def flush_timeout_buffer
@@ -151,8 +154,8 @@ module Fluent
         timeout_stream_identities << stream_identity
         tag = stream_identity.split(":").first
         message = "Timeout flush: #{stream_identity}"
-        router.emit_error_event(tag, now, flushed_record, TimeoutError.new(message))
-        log.info message
+        handle_timeout_error(tag, now, flushed_record, message)
+        log.info(message)
       end
       @timeout_map.reject! do |stream_identity, _|
         timeout_stream_identities.include?(stream_identity)
@@ -169,9 +172,19 @@ module Fluent
         }
         tag, time, record = elements.last
         message = "Flush remaining buffer: #{stream_identity}"
-        router.emit_error_event(tag, time, record.merge(new_record), TimeoutError.new(message))
+        handle_timeout_error(tag, time, record.merge(new_record), message)
+        log.info(message)
       end
       @buffer.clear
+    end
+
+    def handle_timeout_error(tag, time, record, message)
+      if @timeout_label
+        label = Engine.root_agent.find_label(@timeout_label)
+        label.event_router.emit(tag, time, record)
+      else
+        router.emit_error_event(tag, time, record, TimeoutError.new(message))
+      end
     end
 
     class TimeoutTimer < Coolio::TimerWatcher
